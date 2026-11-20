@@ -108,11 +108,10 @@ import {
 
 import {
   HooksDispatcher,
-  prepareToUseHooksForRequest,
+  switchHooksRequest,
   prepareToUseHooksForComponent,
   getThenableStateAfterSuspending,
   getTrackedThenablesAfterRendering,
-  resetHooksForRequest,
 } from './ReactFlightHooks';
 import {DefaultAsyncDispatcher} from './flight/ReactFlightAsyncDispatcher';
 
@@ -564,6 +563,13 @@ type Task = {
 
 interface Reference {}
 
+// An object's reference may include a path within a row. We also keep the
+// containing row's ID so that reusing the object can reuse its ledger entries.
+type WrittenObjectEntry = {
+  id: number,
+  reference: string,
+};
+
 type ReactClientReference = Reference & ReactClientValue;
 
 type DeferredDebugStore = {
@@ -615,7 +621,7 @@ export type Request = {
   writtenSymbols: Map<symbol, number>,
   writtenClientReferences: Map<ClientReferenceKey, number>,
   writtenServerReferences: Map<ServerReference<any>, number>,
-  writtenObjects: WeakMap<Reference, string>,
+  writtenObjects: WeakMap<Reference, WrittenObjectEntry>,
   writtenImportStrings: Map<string, string>,
   // The combined length of the keys in writtenImportStrings.
   writtenImportStringsSize: number,
@@ -899,6 +905,25 @@ export function resolveRequest(): null | Request {
     if (store) return store;
   }
   return null;
+}
+
+function runWithRequest<A, R>(
+  request: Request,
+  callback: (Request, A) => R,
+  argument: A,
+): R {
+  const previousDispatcher = ReactSharedInternals.H;
+  const previousRequest = currentRequest;
+  const previousHooksRequest = switchHooksRequest(request);
+  ReactSharedInternals.H = HooksDispatcher;
+  currentRequest = request;
+  try {
+    return callback(request, argument);
+  } finally {
+    ReactSharedInternals.H = previousDispatcher;
+    currentRequest = previousRequest;
+    switchHooksRequest(previousHooksRequest);
+  }
 }
 
 function isTypedArray(value: any): boolean {
@@ -1374,8 +1399,12 @@ function serializeReadableStream(
     reader.cancel(reason).then(error, error);
   }
 
-  request.cacheController.signal.addEventListener('abort', abortStream);
-  reader.read().then(progress, error);
+  if (request.cacheController.signal.aborted) {
+    abortStream();
+  } else {
+    request.cacheController.signal.addEventListener('abort', abortStream);
+    reader.read().then(progress, error);
+  }
   return serializeByValueID(streamTask.id);
 }
 
@@ -1509,11 +1538,15 @@ function serializeAsyncIterable(
       iterator.throw(reason).then(noop, noop);
     }
   }
-  request.cacheController.signal.addEventListener('abort', abortIterable);
-  if (__DEV__) {
-    callIteratorInDEV(iterator, progress, error);
+  if (request.cacheController.signal.aborted) {
+    abortIterable();
   } else {
-    iterator.next().then(progress, error);
+    request.cacheController.signal.addEventListener('abort', abortIterable);
+    if (__DEV__) {
+      callIteratorInDEV(iterator, progress, error);
+    } else {
+      iterator.next().then(progress, error);
+    }
   }
   return serializeByValueID(streamTask.id);
 }
@@ -2198,7 +2231,7 @@ function renderClientElement(
         debugStack,
       );
       // We also store this in the main dedupe set so that it can be referenced by inline React Elements.
-      request.writtenObjects.set(debugStack, serializeByValueID(id));
+      writeToDedupeMap(request, debugStack, id, serializeByValueID(id));
     }
   }
   const element = __DEV__
@@ -2872,7 +2905,7 @@ function createTaskWithID(
       // If we're in some kind of context we can't necessarily reuse this object depending
       // what parent components are used.
     } else {
-      request.writtenObjects.set(model, serializeByValueID(id));
+      writeToDedupeMap(request, model, id, serializeByValueID(id));
     }
   }
   const task: Task = {
@@ -3029,6 +3062,17 @@ function resolveModel(
     }
   }
   return resolved;
+}
+
+function writeToDedupeMap(
+  request: Request,
+  value: Reference,
+  id: number,
+  reference: string,
+): WrittenObjectEntry {
+  const entry = {id, reference};
+  request.writtenObjects.set(value, entry);
+  return entry;
 }
 
 function serializeByValueID(id: number): string {
@@ -3581,10 +3625,14 @@ function serializeBlob(request: Request, blob: Blob): string {
     reader.cancel(reason).then(error, error);
   }
 
-  request.cacheController.signal.addEventListener('abort', abortBlob);
+  if (request.cacheController.signal.aborted) {
+    abortBlob();
+  } else {
+    request.cacheController.signal.addEventListener('abort', abortBlob);
 
-  // $FlowFixMe[incompatible-type]
-  reader.read().then(progress).catch(error);
+    // $FlowFixMe[incompatible-type]
+    reader.read().then(progress).catch(error);
+  }
 
   return '$B' + newTask.id.toString(16);
 }
@@ -3782,15 +3830,15 @@ function renderModelDestructive(
   if (typeof value === 'object') {
     switch ((value as any).$$typeof) {
       case REACT_ELEMENT_TYPE: {
-        let elementReference = null;
+        let elementEntry = null;
         const writtenObjects = request.writtenObjects;
         if (task.keyPath !== null || task.implicitSlot) {
           // If we're in some kind of context we can't reuse the result of this render or
           // previous renders of this element. We only reuse elements if they're not wrapped
           // by another Server Component.
         } else {
-          const existingReference = writtenObjects.get(value);
-          if (existingReference !== undefined) {
+          const existingEntry = writtenObjects.get(value);
+          if (existingEntry !== undefined) {
             if (modelRoot === value) {
               // This is the ID we're currently emitting so we need to write it
               // once but if we discover it again, we refer to it by id.
@@ -3803,16 +3851,20 @@ function renderModelDestructive(
               // detect whether this already was emitted and synchronously available. In that
               // case we can refer to it synchronously and only make it lazy otherwise.
               // We currently don't have a data structure that lets us see that though.
-              return existingReference;
+              return existingEntry.reference;
             }
           } else if (parentPropertyName.indexOf(':') === -1) {
             // TODO: If the property name contains a colon, we don't dedupe. Escape instead.
-            const parentReference = writtenObjects.get(parent);
-            if (parentReference !== undefined) {
+            const parentEntry = writtenObjects.get(parent);
+            if (parentEntry !== undefined) {
               // If the parent has a reference, we can refer to this object indirectly
               // through the property name inside that parent.
-              elementReference = parentReference + ':' + parentPropertyName;
-              writtenObjects.set(value, elementReference);
+              elementEntry = writeToDedupeMap(
+                request,
+                value,
+                parentEntry.id,
+                parentEntry.reference + ':' + parentPropertyName,
+              );
             }
           }
         }
@@ -3891,12 +3943,12 @@ function renderModelDestructive(
         if (
           typeof newChild === 'object' &&
           newChild !== null &&
-          elementReference !== null
+          elementEntry !== null
         ) {
           // If this element renders another object, we can now refer to that object through
           // the same location as this element.
           if (!writtenObjects.has(newChild)) {
-            writtenObjects.set(newChild, elementReference);
+            writtenObjects.set(newChild, elementEntry);
           }
         }
         return newChild;
@@ -3995,14 +4047,14 @@ function renderModelDestructive(
     }
 
     const writtenObjects = request.writtenObjects;
-    const existingReference = writtenObjects.get(value);
+    const existingEntry = writtenObjects.get(value);
     // $FlowFixMe[method-unbinding]
     if (typeof value.then === 'function') {
       // A weak-pending thenable may never emit, so its reference is marked
       // on the wire ($w instead of $@). That way the client knows to leave
       // it forever pending, instead of erroring it, if the stream closes
       // first.
-      if (existingReference !== undefined) {
+      if (existingEntry !== undefined) {
         if (task.keyPath !== null || task.implicitSlot) {
           // If we're in some kind of context we can't reuse the result of this render or
           // previous renders of this element. We only reuse Promises if they're not wrapped
@@ -4018,7 +4070,7 @@ function renderModelDestructive(
           modelRoot = null;
         } else {
           // We've seen this promise before, so we can just refer to the same result.
-          return existingReference;
+          return existingEntry.reference;
         }
       }
       // We assume that any object with a .then property is a "Thenable" type,
@@ -4028,16 +4080,16 @@ function renderModelDestructive(
         enableFlightWeakThenables && (value as any).status === 'pending_weak'
           ? serializeWeakPromiseID(promiseId)
           : serializePromiseID(promiseId);
-      writtenObjects.set(value, promiseReference);
+      writeToDedupeMap(request, value, promiseId, promiseReference);
       return promiseReference;
     }
 
-    if (existingReference !== undefined) {
+    if (existingEntry !== undefined) {
       if (modelRoot === value) {
-        if (existingReference !== serializeByValueID(task.id)) {
+        if (existingEntry.reference !== serializeByValueID(task.id)) {
           // Turns out that we already have this root at a different reference.
           // Use that after all.
-          return existingReference;
+          return existingEntry.reference;
         }
         // This is the ID we're currently emitting so we need to write it
         // once but if we discover it again, we refer to it by id.
@@ -4045,12 +4097,12 @@ function renderModelDestructive(
       } else {
         // We've already emitted this as an outlined object, so we can
         // just refer to that by its existing ID.
-        return existingReference;
+        return existingEntry.reference;
       }
     } else if (parentPropertyName.indexOf(':') === -1) {
       // TODO: If the property name contains a colon, we don't dedupe. Escape instead.
-      const parentReference = writtenObjects.get(parent);
-      if (parentReference !== undefined) {
+      const parentEntry = writtenObjects.get(parent);
+      if (parentEntry !== undefined) {
         // If the parent has a reference, we can refer to this object indirectly
         // through the property name inside that parent.
         let propertyName = parentPropertyName;
@@ -4073,7 +4125,12 @@ function renderModelDestructive(
               break;
           }
         }
-        writtenObjects.set(value, parentReference + ':' + propertyName);
+        writeToDedupeMap(
+          request,
+          value,
+          parentEntry.id,
+          parentEntry.reference + ':' + propertyName,
+        );
       }
     }
 
@@ -4916,7 +4973,7 @@ function outlineComponentInfo(
   const ref = serializeByValueID(id);
   request.writtenDebugObjects.set(componentInfo, ref);
   // We also store this in the main dedupe set so that it can be referenced by inline React Elements.
-  request.writtenObjects.set(componentInfo, ref);
+  writeToDedupeMap(request, componentInfo, id, ref);
   return ref;
 }
 
@@ -5315,11 +5372,11 @@ function renderDebugModel(
     }
 
     const writtenObjects = request.writtenObjects;
-    const existingReference = writtenObjects.get(value);
-    if (existingReference !== undefined) {
+    const existingEntry = writtenObjects.get(value);
+    if (existingEntry !== undefined) {
       // We've already emitted this as a real object, so we can refer to that by its existing reference.
       // This might be slightly different serialization than what renderDebugModel would've produced.
-      return existingReference;
+      return existingEntry.reference;
     }
 
     if (counter.objectLimit <= 0 && !doNotLimit.has(value)) {
@@ -6259,6 +6316,10 @@ function retryTask(request: Request, task: Task): void {
     return;
   }
 
+  runWithRequest(request, retryTaskWithRequest, task);
+}
+
+function retryTaskWithRequest(request: Request, task: Task): void {
   const prevCanEmitDebugInfo = canEmitDebugInfo;
   task.status = RENDERING;
 
@@ -6320,7 +6381,12 @@ function retryTask(request: Request, task: Task): void {
     if (typeof resolvedModel === 'object' && resolvedModel !== null) {
       // We're not in a contextual place here so we can refer to this object by this ID for
       // any future references.
-      request.writtenObjects.set(resolvedModel, serializeByValueID(task.id));
+      writeToDedupeMap(
+        request,
+        resolvedModel,
+        task.id,
+        serializeByValueID(task.id),
+      );
 
       // Object might contain unresolved values like additional elements.
       // This is simulating what the JSON loop would do if this was part of it.
@@ -6385,6 +6451,10 @@ function retryTask(request: Request, task: Task): void {
 }
 
 function tryStreamTask(request: Request, task: Task): void {
+  runWithRequest(request, tryStreamTaskWithRequest, task);
+}
+
+function tryStreamTaskWithRequest(request: Request, task: Task): void {
   // This is used to try to emit something synchronously but if it suspends,
   // we emit a reference to a new outlined task immediately instead.
   const prevCanEmitDebugInfo = canEmitDebugInfo;
@@ -6406,13 +6476,10 @@ function tryStreamTask(request: Request, task: Task): void {
 
 function performWork(request: Request): void {
   markAsyncSequenceRootTask();
+  runWithRequest(request, performWorkWithRequest, undefined);
+}
 
-  const prevDispatcher = ReactSharedInternals.H;
-  ReactSharedInternals.H = HooksDispatcher;
-  const prevRequest = currentRequest;
-  currentRequest = request;
-  prepareToUseHooksForRequest(request);
-
+function performWorkWithRequest(request: Request): void {
   try {
     const pingedTasks = request.pingedTasks;
     request.pingedTasks = [];
@@ -6424,10 +6491,6 @@ function performWork(request: Request): void {
   } catch (error) {
     logRecoverableError(request, error, null);
     fatalError(request, error);
-  } finally {
-    ReactSharedInternals.H = prevDispatcher;
-    resetHooksForRequest();
-    currentRequest = prevRequest;
   }
 }
 
