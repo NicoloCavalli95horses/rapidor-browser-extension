@@ -7,6 +7,7 @@ import { Graph } from './graph.js';
 import { config } from '../../config.js';
 import { PreIndexing } from './preindexing.js';
 import { analysisActivity } from '../analysis/activity.js';
+import { elementType } from 'prop-types';
 
 
 //===================
@@ -61,7 +62,7 @@ export class Bridge {
 
     const handleCommit = debounceWithMaxTime(async (fiber) => {
       await self.capture(fiber);
-    }, {debounceT: config.debounceTimeMs, maxT: config.throttleTimeMs});
+    }, { debounceT: config.debounceTimeMs, maxT: config.throttleTimeMs });
 
     function wrap(fn) {
       return function (rendererID, root, ...args) {
@@ -124,7 +125,7 @@ export class Bridge {
   // a debounced commit and a forced capture (settle) must never run at the same time.
   capture(fiber) {
     this._captureChain = this._captureChain
-      .catch(() => {})
+      .catch(() => { })
       .then(() => this.handleStateGraph(fiber));
     return this._captureChain;
   }
@@ -270,11 +271,14 @@ export class Bridge {
     const componentId = this.getComponentTypeId(node.elementType ?? node.type);
     this.updateComponentIndex(componentId, id);
 
+    const dom = this.findDOMNode(node);
+
     return {
       keep: true,
       id,
       data: {
         id,
+        dom: this.openingTag(dom),
         componentId,
         key: node.key,
         tag: node.tag,
@@ -282,6 +286,44 @@ export class Bridge {
         props: this.getSerializableValues({ obj: node.memoizedProps }),
       }
     };
+  }
+
+  // The element's own start tag (`<a class="x" href="/y">`): RAPIDOR only reads its tag/role/class, and the
+  // full outerHTML repeated each subtree at every ancestor (~60% of a graph). The shallow copy lives in an
+  // inert document, so no custom-element constructor runs and no resource loads. Text nodes -> null.
+  openingTag(dom) {
+    if (!(dom instanceof Element)) { return null; }
+    this._inertDoc ??= document.implementation.createHTMLDocument('');
+    const html = this._inertDoc.importNode(dom, false).outerHTML;
+    let quote = null;
+    for (let i = 0; i < html.length; i++) {
+      const c = html[i];
+      if (quote) { if (c === quote) { quote = null; } }
+      else if (c === '"' || c === "'") { quote = c; }
+      else if (c === '>') { return html.slice(0, i + 1); }
+    }
+    return html || null;
+  }
+
+  // return the first DOM element among children nodes
+  findDOMNode(fiber) {
+    if (!fiber) { return null; }
+
+    // HostComponent o HostText
+    if (fiber.stateNode instanceof Node) {
+      return fiber.stateNode;
+    }
+
+    let child = fiber.child;
+
+    while (child) {
+      const result = this.findDOMNode(child);
+      if (result) { return result; }
+
+      child = child.sibling;
+    }
+
+    return null;
   }
 
 
