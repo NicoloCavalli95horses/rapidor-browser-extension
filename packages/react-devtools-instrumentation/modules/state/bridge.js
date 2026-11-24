@@ -7,7 +7,6 @@ import { Graph } from './graph.js';
 import { config } from '../../config.js';
 import { PreIndexing } from './preindexing.js';
 import { analysisActivity } from '../analysis/activity.js';
-import { elementType } from 'prop-types';
 
 
 //===================
